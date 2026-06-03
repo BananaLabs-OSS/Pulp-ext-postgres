@@ -16,28 +16,33 @@ Requires the `DATABASE_URL` environment variable set to a valid Postgres connect
 
 - `storage.sqlite` — registers the same `sqlite_exec` and `sqlite_query` host imports as ext-sqlite so existing cell WASM binaries work without recompilation. The capability name is an ABI compatibility surface, not a backend indicator. Cell-side code switches to Postgres dialect (`pgdialect.New()`) to emit `$1` params, `RETURNING`, etc. The host executes whatever SQL it receives.
 
-## Per-cell isolation
+## Schema scoping
 
-ext-sqlite gives each cell its own database file, so a cell physically cannot touch another cell's data. This extension reproduces that isolation on a shared Postgres server: each declaring cell gets its own Postgres schema (`cell_<sanitized-cell-name>`), and that cell's connection pool is pinned to it via `search_path`. A cell's unqualified `CREATE`/`SELECT`/`UPDATE`/`DELETE`/`DROP` resolves into its own private schema, so cell A cannot see, list, or scan cell B's tables. The host never parses or rewrites cell SQL — scoping is purely at the connection level.
+### Shared schema (default)
 
-The schema is created automatically (`CREATE SCHEMA IF NOT EXISTS`) on first cell load. The connection string user therefore needs `CREATE` on the database.
+By default **all cells share one Postgres schema** (`public`), exactly as the pre-isolation pool did. This is the safe, no-migration default because the platform's first-party cells intentionally share tables: the Evolution engine *writes* `game_visibility`/`tier`/`server` and the Sessions gene *reads* them via unqualified queries against the **same** table. Isolating those cells into separate schemas would make the gene's reads resolve into an empty schema (blank game names, `price = 0`, wrong capacity), so shared is the correct default for this deployment.
 
-### Shared-schema mode (opt-out of isolation)
-
-Some deployments intentionally share tables across cells — e.g. the Evolution engine writes `game_visibility` and the Sessions gene reads it from the same table. To place **all** cells in one schema instead of per-cell schemas, set:
+No configuration is required. Optionally point the shared schema somewhere other than `public`:
 
 ```
-STORAGE_POSTGRES_SHARED_SCHEMA=public
+STORAGE_POSTGRES_SHARED_SCHEMA=myschema
 ```
 
-This is an explicit opt-out of isolation. Leave it unset for the safe per-cell-isolated default.
+When the shared schema is `public` (the default) the host issues **no** DDL on cell load, so the connection role needs no `CREATE` privilege. A non-`public` shared schema is auto-created (`CREATE SCHEMA IF NOT EXISTS`) and so requires `CREATE` on the database.
 
-### Migrating existing data
+### Per-cell isolation (opt-in)
 
-Data written before this change lives in whatever schema the pre-isolation pool used (typically `public`). After upgrading:
+ext-sqlite gives each cell its own database file, so a cell physically cannot touch another cell's data. This extension can reproduce that isolation on a shared Postgres server by giving each declaring cell its own schema (`cell_<sanitized-cell-name>`) and pinning that cell's pool to it via `search_path`, so a cell's unqualified `CREATE`/`SELECT`/`UPDATE`/`DELETE`/`DROP` resolves only into its own private schema and cell A cannot see, list, or scan cell B's tables.
 
-- **Shared deployments** (Evolution + Sessions-Gene today): set `STORAGE_POSTGRES_SHARED_SCHEMA=public` to keep using the existing tables unchanged — no data migration needed.
-- **New isolation**: a cell's first run starts with an empty private schema. To carry forward existing tables, move them with `ALTER TABLE public.<t> SET SCHEMA cell_<cell>;` per cell, or repopulate.
+This is intended for a **future untrusted-cell scenario** — it is **not** safe for the current first-party shared-table design (it breaks the Evolution↔Sessions-Gene read). Enable it explicitly:
+
+```
+STORAGE_POSTGRES_ISOLATE=true
+```
+
+Per-cell schemas are auto-created on first cell load, so the connection role needs `CREATE` on the database. To carry forward existing `public` tables into a cell's private schema, move them with `ALTER TABLE public.<t> SET SCHEMA cell_<cell>;` per cell, or repopulate.
+
+The host never parses or rewrites cell SQL in either mode — scoping is purely at the connection level (`search_path`).
 
 ## Notes
 

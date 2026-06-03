@@ -7,25 +7,31 @@
 // switches to pgdialect to emit Postgres-flavoured SQL; the host
 // simply executes whatever SQL it receives.
 //
-// Isolation: ext-sqlite gives each cell its own physical database file,
-// so a cell physically cannot touch another cell's data. This extension
-// reproduces that isolation on a shared Postgres server by giving each
-// declaring cell its own Postgres schema and pinning that cell's
-// connection pool to it via search_path. A cell's unqualified
-// CREATE/SELECT/UPDATE/DELETE therefore resolves into its own private
-// schema; cell A cannot see, list, or scan cell B's tables.
+// Shared schema (DEFAULT): the platform's first-party cells
+// intentionally share tables — e.g. the Evolution engine WRITES
+// game_visibility/tier/server and the Sessions gene READS them via
+// unqualified queries against the SAME table. To preserve that design
+// (and the existing production data, which lives in `public`), all
+// cells share one schema by default. The shared schema is `public`
+// unless STORAGE_POSTGRES_SHARED_SCHEMA names a different one. This is
+// the behaviour the pre-isolation pool had, so it is a no-migration,
+// prod-preserving default.
+//
+// Per-cell isolation (OPT-IN): ext-sqlite gives each cell its own
+// physical database file, so a cell physically cannot touch another
+// cell's data. This extension can reproduce that isolation on a shared
+// Postgres server by giving each declaring cell its own Postgres schema
+// and pinning that cell's connection pool to it via search_path — a
+// cell's unqualified CREATE/SELECT/UPDATE/DELETE then resolves into its
+// own private schema and cell A cannot see, list, or scan cell B's
+// tables. This is for a FUTURE untrusted-cell scenario and is NOT safe
+// for the current first-party shared-table deployment, so it is opt-in:
+// set STORAGE_POSTGRES_ISOLATE=true to enable per-cell schemas.
 //
 // The host never parses or rewrites the cell's SQL — scoping is done
 // purely at the connection level (search_path), so no key-prefix /
 // cell_id column threading is required and existing cell SQL is
 // unchanged.
-//
-// Shared-schema mode: some deployments intentionally share tables
-// across cells (e.g. one cell writes a table another cell reads). Set
-// STORAGE_POSTGRES_SHARED_SCHEMA to a schema name (e.g. "public") to
-// place ALL cells in that one schema instead of per-cell schemas. This
-// is an explicit opt-out of isolation; leave it unset for the safe
-// per-cell-isolated default.
 //
 // Deployment:
 //
@@ -36,9 +42,11 @@
 //	sqlite_exec(query_ptr, query_len, params_ptr, params_len, res_ptr_out, res_len_out) -> error_code
 //	sqlite_query(query_ptr, query_len, params_ptr, params_len, rows_ptr_out, rows_len_out) -> error_code
 //
-// All cells share a single Postgres server (one DATABASE_URL) but get
-// separate connection pools pinned to separate schemas. The connection
-// string is read from the DATABASE_URL environment variable.
+// All cells share a single Postgres server (one DATABASE_URL). By
+// default they also share one schema (public); with
+// STORAGE_POSTGRES_ISOLATE=true each cell instead gets a pool pinned to
+// its own schema. The connection string is read from the DATABASE_URL
+// environment variable.
 //
 // Note: LastInsertID is always 0 on the Postgres backend (Postgres has
 // no last-insert-id via database/sql) — cells must use RETURNING. This
@@ -68,12 +76,17 @@ import (
 // first Register with the manifest's cell name baked in. Each cell's
 // pool is pinned to that cell's schema via search_path.
 type pgManager struct {
-	mu           sync.RWMutex
+	mu sync.RWMutex
 	dbs          map[string]*sql.DB
 	dsn          string
-	sharedSchema string // STORAGE_POSTGRES_SHARED_SCHEMA; "" => per-cell isolation
+	isolate      bool   // STORAGE_POSTGRES_ISOLATE=true => per-cell schemas (opt-in)
+	sharedSchema string // shared-mode target schema; defaults to "public"
 	logger       *slog.Logger
 }
+
+// defaultSharedSchema is the schema all cells share when isolation is
+// not opted into. This preserves the pre-isolation production layout.
+const defaultSharedSchema = "public"
 
 var manager = &pgManager{dbs: map[string]*sql.DB{}}
 
@@ -106,14 +119,26 @@ func setup(env ext.SetupEnv) error {
 		return fmt.Errorf("storage.postgres: DATABASE_URL not set")
 	}
 	manager.dsn = dsn
-	manager.sharedSchema = sanitizeSchema(os.Getenv("STORAGE_POSTGRES_SHARED_SCHEMA"))
+
+	// Per-cell isolation is OPT-IN. The default preserves the first-party
+	// shared-table deployment (Evolution writes / Sessions-Gene reads the
+	// same tables) and the existing prod data in `public`.
+	manager.isolate = isTrue(os.Getenv("STORAGE_POSTGRES_ISOLATE"))
+
+	// In shared mode, all cells live in one schema: STORAGE_POSTGRES_SHARED_SCHEMA
+	// if set, else `public`. This value is unused when isolation is on.
+	shared := sanitizeSchema(os.Getenv("STORAGE_POSTGRES_SHARED_SCHEMA"))
+	if shared == "" {
+		shared = defaultSharedSchema
+	}
+	manager.sharedSchema = shared
 
 	// Log only host/dbname — never substring the raw DSN, which can
 	// expose username/password.
-	if manager.sharedSchema != "" {
-		manager.logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "shared-schema", "schema", manager.sharedSchema)
-	} else {
+	if manager.isolate {
 		manager.logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "per-cell-isolated")
+	} else {
+		manager.logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "shared-schema", "schema", manager.sharedSchema)
 	}
 	return nil
 }
@@ -154,11 +179,13 @@ func teardownCell(_ context.Context, cellID string) error {
 	return nil
 }
 
-// schemaFor resolves which Postgres schema a cell's pool is pinned to:
-// the shared schema if configured, else a per-cell schema derived from
-// the cell name.
+// schemaFor resolves which Postgres schema a cell's pool is pinned to.
+// Default (isolate=false): the shared schema, so all cells resolve
+// unqualified names into the same schema and first-party cells can read
+// each other's tables. Opt-in (isolate=true): a per-cell schema derived
+// from the cell name, giving each cell a private namespace.
 func (m *pgManager) schemaFor(cellID string) string {
-	if m.sharedSchema != "" {
+	if !m.isolate {
 		return m.sharedSchema
 	}
 	s := sanitizeSchema(cellID)
@@ -191,18 +218,25 @@ func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
 
 	schema := m.schemaFor(cellID)
 
-	// Create the schema on a short-lived pool that is NOT pinned to it
-	// (the schema may not exist yet, which would make a pinned
-	// connection's search_path point at nothing).
-	bootstrap, err := sql.Open("postgres", m.dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open bootstrap: %w", err)
-	}
-	if _, err := bootstrap.Exec(`CREATE SCHEMA IF NOT EXISTS "` + schema + `"`); err != nil {
+	// Create the schema unless it is `public`, which always exists and
+	// whose creation a least-privilege managed-Postgres role may not be
+	// allowed to run (CREATE SCHEMA needs CREATE on the database). The
+	// shared-schema default targets `public`, so the common path issues
+	// no DDL and imposes no new privilege requirement. Per-cell schemas
+	// (and any non-public shared schema) are created on a short-lived
+	// pool that is NOT pinned to them — a pinned connection's search_path
+	// would otherwise point at a not-yet-existing schema.
+	if schema != "public" {
+		bootstrap, err := sql.Open("postgres", m.dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open bootstrap: %w", err)
+		}
+		if _, err := bootstrap.Exec(`CREATE SCHEMA IF NOT EXISTS "` + schema + `"`); err != nil {
+			bootstrap.Close()
+			return nil, fmt.Errorf("create schema %q: %w", schema, err)
+		}
 		bootstrap.Close()
-		return nil, fmt.Errorf("create schema %q: %w", schema, err)
 	}
-	bootstrap.Close()
 
 	// Pin the cell's pool to its schema. search_path is set per
 	// connection via the libpq `options` parameter, so every pooled
@@ -240,6 +274,17 @@ func (m *pgManager) get(cellID string) (*sql.DB, bool) {
 	defer m.mu.RUnlock()
 	db, ok := m.dbs[cellID]
 	return db, ok
+}
+
+// isTrue reports whether an env-var value means "enabled". Accepts the
+// common truthy spellings so deploys can use 1/true/yes/on.
+func isTrue(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // sanitizeSchema lowercases s and strips anything outside [a-z0-9_], so
