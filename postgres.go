@@ -506,11 +506,10 @@ func pgErrorCode(err error) uint32 {
 	case strings.Contains(msg, "deadlock"),
 		strings.Contains(msg, "could not serialize"):
 		return 12
-	case strings.Contains(msg, "unique_violation"),
-		strings.Contains(msg, "foreign_key_violation"),
-		strings.Contains(msg, "not-null_violation"),
-		strings.Contains(msg, "check_violation"),
-		strings.Contains(msg, "duplicate key"):
+	case strings.Contains(msg, "duplicate key"),
+		strings.Contains(msg, "foreign key constraint"),
+		strings.Contains(msg, "not-null constraint"),
+		strings.Contains(msg, "check constraint"):
 		return 13
 	case strings.Contains(msg, "read_only"),
 		strings.Contains(msg, "insufficient_privilege"):
