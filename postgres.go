@@ -238,12 +238,22 @@ func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
 		bootstrap.Close()
 	}
 
-	// Pin the cell's pool to its schema. search_path is set per
-	// connection via the libpq `options` parameter, so every pooled
-	// connection resolves unqualified names into this cell's schema.
-	dsn, err := dsnWithSearchPath(m.dsn, schema)
-	if err != nil {
-		return nil, fmt.Errorf("build dsn: %w", err)
+	// Pin the cell's pool to its schema. For the default `public` schema we
+	// DO NOT set search_path: public is already first on Postgres's default
+	// search_path, so pinning it is redundant — AND a managed pooler
+	// (Crunchy Bridge / pgbouncer) REJECTS the libpq startup `options`
+	// parameter ("unsupported startup parameter in options: search_path"),
+	// which crash-loops every shared-mode cell behind the pooler. Only a
+	// non-public schema (per-cell isolation, or a custom shared schema)
+	// needs the explicit pin. (Isolation behind pgbouncer would still need a
+	// post-connect `SET search_path`; it's opt-in and unused in shared prod.)
+	dsn := m.dsn
+	if schema != "public" {
+		withPath, err := dsnWithSearchPath(m.dsn, schema)
+		if err != nil {
+			return nil, fmt.Errorf("build dsn: %w", err)
+		}
+		dsn = withPath
 	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
