@@ -335,6 +335,13 @@ func dsnWithSearchPath(dsn, schema string) (string, error) {
 	}
 	// Keyword/value form. libpq treats `options` as a single value;
 	// quote it so the embedded space is not parsed as a new keyword.
+	// If the DSN already contains an `options=` keyword, appending a
+	// second one would be silently ignored by libpq (first wins). Detect
+	// and return an error so misconfigured DSNs are loud rather than
+	// silently broken.
+	if strings.Contains(dsn, "options=") {
+		return "", fmt.Errorf("storage.postgres: keyword/value DSN already contains 'options='; cannot append search_path — use a URL-form DSN instead")
+	}
 	return dsn + " options='" + opt + "'", nil
 }
 
