@@ -438,13 +438,8 @@ func pgExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, 
 	} else {
 		out.RowsAffected = ra
 	}
-	if lid, lidErr := res.LastInsertId(); lidErr != nil {
-		// Postgres does not support LastInsertId via the database/sql
-		// interface — callers should use RETURNING instead. Silently
-		// swallow rather than warn on every INSERT.
-	} else {
-		out.LastInsertID = lid
-	}
+	// Postgres has no LastInsertId; out.LastInsertID stays 0 by design.
+	// Callers that need the inserted ID should use a RETURNING clause instead.
 	encoded, err := msgpack.Marshal(out)
 	if err != nil {
 		return 5
