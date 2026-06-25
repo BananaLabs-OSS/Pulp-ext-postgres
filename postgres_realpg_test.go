@@ -20,6 +20,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
@@ -141,7 +142,7 @@ func TestRealPG_PerCellIsolation(t *testing.T) {
 		t.Fatal("ISOLATION BREACH: sessions read evolution's table across schemas")
 	}
 	// The error must be "relation does not exist", not a connection failure.
-	if !contains(err.Error(), "does not exist") {
+	if !strings.Contains(err.Error(), "does not exist") {
 		t.Fatalf("sessions query: want undefined-table error, got: %v", err)
 	}
 }
@@ -253,13 +254,3 @@ func TestRealPG_BooleanRoundTrip(t *testing.T) {
 	}
 }
 
-// contains is a tiny strings.Contains wrapper kept local so the test file
-// has no extra import churn against the package's own import set.
-func contains(haystack, needle string) bool {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return true
-		}
-	}
-	return false
-}
