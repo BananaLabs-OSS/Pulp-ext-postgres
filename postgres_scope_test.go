@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -48,10 +49,9 @@ func testSetup(namespace string, isolate bool) pgSetup {
 	}
 }
 
-// TestScopedSchemaOwnership is hermetic: it proves the decision before any
-// network connection is attempted. Shared mode keeps Evolution's cooperating
-// cells together, while same-named cells in another app/instance have a
-// separate schema. Isolation adds the complete cell placement to that key.
+// TestScopedSchemaOwnership is hermetic: it proves that the compatibility
+// shared schema is retained across explicit Pulp applications until a verified
+// data ownership migration enables physical schema isolation.
 func TestScopedSchemaOwnership(t *testing.T) {
 	m := newPGManager()
 	evolution := testScope(t, "evolution", "blue", "sessions", "primary")
@@ -62,13 +62,31 @@ func TestScopedSchemaOwnership(t *testing.T) {
 	m.setups[pgApplicationScopeKey(sessions)] = testSetup("sessions-store", false)
 	m.setups[pgApplicationScopeKey(green)] = testSetup("evolution-store", false)
 
-	if got, want := m.schemaForScope(evolutionOtherCell), m.schemaForScope(evolution); got != want {
-		t.Fatalf("shared app cells chose different schemas: %q != %q", got, want)
-	}
-	for _, other := range []ext.Scope{sessions, green} {
-		if got, want := m.schemaForScope(other), m.schemaForScope(evolution); got == want {
-			t.Fatalf("application isolation breach: %q and %q both use %q", evolution.RoutingID(), other.RoutingID(), got)
+	for _, scope := range []ext.Scope{evolution, evolutionOtherCell, sessions, green} {
+		if got := m.schemaForScope(scope); got != defaultSharedSchema {
+			t.Fatalf("shared scope %q schema = %q, want %q", scope.RoutingID(), got, defaultSharedSchema)
 		}
+		setup := m.setupForScopeLocked(scope)
+		if got := schemaForSetup(scope, setup); got != defaultSharedSchema {
+			t.Fatalf("shared setup %q schema = %q, want %q", scope.RoutingID(), got, defaultSharedSchema)
+		}
+	}
+	poolerDSN, err := dsnForSchema(testSetup("evolution-store", false).dsn, m.schemaForScope(evolution))
+	if err != nil {
+		t.Fatalf("pooler-safe shared DSN: %v", err)
+	}
+	if strings.Contains(poolerDSN, "options=") || strings.Contains(poolerDSN, "search_path") {
+		t.Fatalf("shared public DSN must not add startup search_path options: %q", poolerDSN)
+	}
+	custom := testScope(t, "resolver", "primary", "storage", "primary")
+	customSetup := testSetup("resolver-store", false)
+	customSetup.sharedSchema = "legacy_shared"
+	m.setups[pgApplicationScopeKey(custom)] = customSetup
+	if got := m.schemaForScope(custom); got != customSetup.sharedSchema {
+		t.Fatalf("custom shared scope schema = %q, want %q", got, customSetup.sharedSchema)
+	}
+	if got := schemaForSetup(custom, customSetup); got != customSetup.sharedSchema {
+		t.Fatalf("custom shared setup schema = %q, want %q", got, customSetup.sharedSchema)
 	}
 
 	m.setups[pgApplicationScopeKey(evolution)] = testSetup("evolution-store", true)

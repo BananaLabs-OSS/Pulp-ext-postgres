@@ -346,27 +346,24 @@ func schemaName(prefix string, parts ...string) string {
 	return prefix + "_" + readable + "_" + digest
 }
 
-// schemaForScope preserves the legacy public/shared schema behavior for old
-// hosts. Explicit Pulp scopes receive an application-instance schema in
-// shared mode, and a cell-instance schema in isolation mode. Thus shared
-// first-party cells within one app still share tables, but identically named
-// cells in another app can never reach them through an unqualified query.
+// schemaForScope resolves a scope's database schema. Shared mode deliberately
+// preserves the configured shared schema for both legacy and explicit Pulp
+// scopes so existing shared-table deployments continue to work while physical
+// schema isolation remains opt-in. Isolation gives each explicit cell instance
+// its own schema.
 func (m *pgManager) schemaForScope(scope ext.Scope) string {
 	m.mu.RLock()
 	setup := m.setupForScopeLocked(scope)
 	m.mu.RUnlock()
+	if !setup.isolate {
+		return setup.sharedSchema
+	}
 	if scope.IsLegacy() {
-		if !setup.isolate {
-			return setup.sharedSchema
-		}
 		return legacyCellSchema(scope.CellID())
 	}
 	parts := []string{scope.ApplicationID(), scope.ApplicationInstanceID(), setup.storageNamespace}
-	if setup.isolate {
-		parts = append(parts, scope.CellID(), scope.CellInstanceID())
-		return schemaName("cell", parts...)
-	}
-	return schemaName("app", parts...)
+	parts = append(parts, scope.CellID(), scope.CellInstanceID())
+	return schemaName("cell", parts...)
 }
 
 func legacyCellSchema(cellID string) string {
@@ -435,13 +432,9 @@ func (m *pgManager) openLegacyForCell(cellID string) (*sql.DB, error) {
 	// non-public schema (per-cell isolation, or a custom shared schema)
 	// needs the explicit pin. (Isolation behind pgbouncer would still need a
 	// post-connect `SET search_path`; it's opt-in and unused in shared prod.)
-	dsn := m.dsn
-	if schema != "public" {
-		withPath, err := dsnWithSearchPath(m.dsn, schema)
-		if err != nil {
-			return nil, fmt.Errorf("build dsn: %w", err)
-		}
-		dsn = withPath
+	dsn, err := dsnForSchema(m.dsn, schema)
+	if err != nil {
+		return nil, fmt.Errorf("build dsn: %w", err)
 	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -491,17 +484,14 @@ func pgKey(scope ext.Scope) (ext.ResourceKey, error) {
 }
 
 func schemaForSetup(scope ext.Scope, setup pgSetup) string {
+	if !setup.isolate {
+		return setup.sharedSchema
+	}
 	if scope.IsLegacy() {
-		if !setup.isolate {
-			return setup.sharedSchema
-		}
 		return legacyCellSchema(scope.CellID())
 	}
 	parts := []string{scope.ApplicationID(), scope.ApplicationInstanceID(), setup.storageNamespace}
-	if setup.isolate {
-		return schemaName("cell", append(parts, scope.CellID(), scope.CellInstanceID())...)
-	}
-	return schemaName("app", parts...)
+	return schemaName("cell", append(parts, scope.CellID(), scope.CellInstanceID())...)
 }
 
 func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
@@ -548,13 +538,9 @@ func (m *pgManager) openForScope(scope ext.Scope) (*sql.DB, error) {
 		}
 		_ = bootstrap.Close()
 	}
-	dsn := setup.dsn
-	if schema != "public" {
-		withPath, err := dsnWithSearchPath(setup.dsn, schema)
-		if err != nil {
-			return nil, fmt.Errorf("build dsn: %w", err)
-		}
-		dsn = withPath
+	dsn, err := dsnForSchema(setup.dsn, schema)
+	if err != nil {
+		return nil, fmt.Errorf("build dsn: %w", err)
 	}
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -654,6 +640,16 @@ func sanitizeSchema(s string) string {
 		}
 	}
 	return strings.Trim(b.String(), "_")
+}
+
+// dsnForSchema returns a DSN suitable for the requested schema. `public` is
+// already first on PostgreSQL's default search_path, so it intentionally keeps
+// the original DSN: managed poolers reject libpq startup `options` parameters.
+func dsnForSchema(dsn, schema string) (string, error) {
+	if schema == defaultSharedSchema {
+		return dsn, nil
+	}
+	return dsnWithSearchPath(dsn, schema)
 }
 
 // dsnWithSearchPath returns dsn with libpq `options=-c search_path=<schema>`
