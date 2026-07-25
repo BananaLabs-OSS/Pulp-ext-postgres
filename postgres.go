@@ -55,20 +55,23 @@ package postgresext
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
+	_ "github.com/lib/pq"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/vmihailenco/msgpack/v5"
-	_ "github.com/lib/pq"
 )
 
 // manager owns per-cell *sql.DB handles. Setup runs once (cell name is
@@ -76,28 +79,71 @@ import (
 // first Register with the manifest's cell name baked in. Each cell's
 // pool is pinned to that cell's schema via search_path.
 type pgManager struct {
-	mu sync.RWMutex
-	dbs          map[string]*sql.DB
+	mu     sync.RWMutex
+	dbs    map[ext.ResourceKey]*sql.DB
+	setups map[pgApplicationKey]pgSetup
+
+	// Legacy single-application configuration. Explicit application setups
+	// never mutate or read another application's setup entry.
 	dsn          string
-	isolate      bool   // STORAGE_POSTGRES_ISOLATE=true => per-cell schemas (opt-in)
-	sharedSchema string // shared-mode target schema; defaults to "public"
+	isolate      bool
+	sharedSchema string
 	logger       *slog.Logger
+}
+
+type pgApplicationKey struct {
+	applicationID string
+	instanceID    string
+}
+
+type pgSetup struct {
+	dsn              string
+	isolate          bool
+	sharedSchema     string
+	storageNamespace string
+	logger           *slog.Logger
 }
 
 // defaultSharedSchema is the schema all cells share when isolation is
 // not opted into. This preserves the pre-isolation production layout.
 const defaultSharedSchema = "public"
 
-var manager = &pgManager{dbs: map[string]*sql.DB{}}
+func newPGManager() *pgManager {
+	return &pgManager{
+		dbs:    map[ext.ResourceKey]*sql.DB{},
+		setups: map[pgApplicationKey]pgSetup{},
+	}
+}
+
+var manager = newPGManager()
+
+// ErrConnectionUnavailable means the requested scoped pool has not been
+// registered, or has already been released by its scope teardown. It does not
+// reveal whether another scope currently owns a pool.
+var ErrConnectionUnavailable = errors.New("storage.postgres: scoped connection unavailable")
+
+// ExistingConnection returns the already-open Postgres pool owned by exactly
+// scope. It never reads configuration, opens a connection, or creates a
+// schema. Callers must not close the returned pool: its lifecycle remains
+// owned by this extension and the pool is released by the matching scope
+// teardown.
+//
+// A scope can resolve only its exact resource key. In particular, an
+// application, instance, cell, or cell-instance mismatch cannot fall back to
+// another scope's pool.
+func ExistingConnection(scope ext.Scope) (*sql.DB, error) {
+	return manager.existingConnection(scope)
+}
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:         "storage.sqlite", // same ABI surface as ext-sqlite
-		Setup:        setup,
-		Teardown:     teardown,
-		Register:     bindActive,
-		Stub:         bindStub,
-		TeardownCell: teardownCell,
+		Name:          "storage.sqlite", // same ABI surface as ext-sqlite
+		Setup:         setup,
+		Teardown:      teardown,
+		TeardownScope: teardownScope,
+		Register:      bindActive,
+		Stub:          bindStub,
+		TeardownCell:  teardownCell,
 	})
 }
 
@@ -105,25 +151,31 @@ func init() {
 // calls Setup once with an empty CellName, so a pool opened here could
 // not be pinned to a cell's schema. Pools are opened lazily from
 // Register() once the cell identity is known.
-func setup(env ext.SetupEnv) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+func setup(env ext.SetupEnv) error { return manager.setup(env) }
 
-	manager.logger = env.Logger
-	if manager.logger == nil {
-		manager.logger = slog.Default()
+func (m *pgManager) setup(env ext.SetupEnv) error {
+	scope := env.EffectiveScope()
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("storage.postgres: invalid setup scope: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+
+	logger := env.Logger
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
 		return fmt.Errorf("storage.postgres: DATABASE_URL not set")
 	}
-	manager.dsn = dsn
 
 	// Per-cell isolation is OPT-IN. The default preserves the first-party
 	// shared-table deployment (Evolution writes / Sessions-Gene reads the
 	// same tables) and the existing prod data in `public`.
-	manager.isolate = isTrue(os.Getenv("STORAGE_POSTGRES_ISOLATE"))
+	isolate := isTrue(os.Getenv("STORAGE_POSTGRES_ISOLATE"))
 
 	// In shared mode, all cells live in one schema: STORAGE_POSTGRES_SHARED_SCHEMA
 	// if set, else `public`. This value is unused when isolation is on.
@@ -131,14 +183,34 @@ func setup(env ext.SetupEnv) error {
 	if shared == "" {
 		shared = defaultSharedSchema
 	}
-	manager.sharedSchema = shared
+	setup := pgSetup{
+		dsn:              dsn,
+		isolate:          isolate,
+		sharedSchema:     shared,
+		storageNamespace: storageNamespaceFromRoot(scope, env.StorageRoot),
+		logger:           logger,
+	}
+	owner := pgApplicationScopeKey(scope)
+	if existing, ok := m.setups[owner]; ok {
+		if existing.dsn != setup.dsn || existing.isolate != setup.isolate || existing.sharedSchema != setup.sharedSchema || existing.storageNamespace != setup.storageNamespace {
+			return fmt.Errorf("storage.postgres: application %s/%s setup already owns its database configuration; refusing replacement", owner.applicationID, owner.instanceID)
+		}
+		return nil
+	}
+	m.setups[owner] = setup
+	if scope.IsLegacy() {
+		m.dsn, m.isolate, m.sharedSchema, m.logger = setup.dsn, setup.isolate, setup.sharedSchema, setup.logger
+	}
+	if m.logger == nil {
+		m.logger = logger
+	}
 
 	// Log only host/dbname — never substring the raw DSN, which can
 	// expose username/password.
-	if manager.isolate {
-		manager.logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "per-cell-isolated")
+	if isolate {
+		logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "per-cell-isolated", "application", owner.applicationID, "instance", owner.instanceID)
 	} else {
-		manager.logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "shared-schema", "schema", manager.sharedSchema)
+		logger.Info("storage.postgres setup", "endpoint", dsnEndpoint(dsn), "mode", "shared-schema", "schema", shared, "application", owner.applicationID, "instance", owner.instanceID)
 	}
 	return nil
 }
@@ -146,15 +218,49 @@ func setup(env ext.SetupEnv) error {
 // teardown closes every open per-cell pool. Safe to call more than once
 // — closed handles are removed from the map.
 func teardown(_ context.Context) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+	return manager.teardown()
+}
+
+// teardown retains the single-app cleanup behavior. Scoped application pools
+// are released only by TeardownScope so one application cannot stop another.
+func (m *pgManager) teardown() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	var first error
-	for name, db := range manager.dbs {
+	for name, db := range m.dbs {
+		if !name.Scope().IsLegacy() {
+			continue
+		}
 		if err := db.Close(); err != nil && first == nil {
 			first = fmt.Errorf("close %s: %w", name, err)
 		}
-		delete(manager.dbs, name)
+		delete(m.dbs, name)
 	}
+	delete(m.setups, pgApplicationScopeKey(ext.LegacyScope("host")))
+	m.dsn = ""
+	return first
+}
+
+func teardownScope(_ context.Context, scope ext.Scope) error { return manager.teardownScope(scope) }
+
+func (m *pgManager) teardownScope(scope ext.Scope) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("storage.postgres: invalid teardown scope: %w", err)
+	}
+	owner := pgApplicationScopeKey(scope)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var first error
+	for key, db := range m.dbs {
+		if pgApplicationScopeKey(key.Scope()) != owner {
+			continue
+		}
+		if err := db.Close(); err != nil && first == nil {
+			first = fmt.Errorf("close %s: %w", key, err)
+		}
+		delete(m.dbs, key)
+	}
+	delete(m.setups, owner)
 	return first
 }
 
@@ -163,20 +269,7 @@ func teardown(_ context.Context) error {
 // schema and data are left intact in Postgres (a stopped cell may be
 // restarted); only the cached connection pool is released.
 func teardownCell(_ context.Context, cellID string) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	db, ok := manager.dbs[cellID]
-	if !ok {
-		return nil
-	}
-	delete(manager.dbs, cellID)
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("close %s: %w", cellID, err)
-	}
-	if manager.logger != nil {
-		manager.logger.Info("storage.postgres teardown cell", "cell", cellID)
-	}
-	return nil
+	return manager.closeCellTarget(cellID)
 }
 
 // schemaFor resolves which Postgres schema a cell's pool is pinned to.
@@ -195,12 +288,107 @@ func (m *pgManager) schemaFor(cellID string) string {
 	return "cell_" + s
 }
 
+func pgApplicationScopeKey(scope ext.Scope) pgApplicationKey {
+	return pgApplicationKey{applicationID: scope.ApplicationID(), instanceID: scope.ApplicationInstanceID()}
+}
+
+func (m *pgManager) ensureMapsLocked() {
+	if m.dbs == nil {
+		m.dbs = make(map[ext.ResourceKey]*sql.DB)
+	}
+	if m.setups == nil {
+		m.setups = make(map[pgApplicationKey]pgSetup)
+	}
+}
+
+func storageNamespaceFromRoot(scope ext.Scope, storageRoot string) string {
+	if scope.IsLegacy() || storageRoot == "" {
+		return ""
+	}
+	// Pulp's multi-app runtime supplies <root>/<storage_namespace>/<instance>.
+	// The namespace is used only as an additional schema-name component; the
+	// application and instance identity remain mandatory, so an unusual direct
+	// caller cannot make two applications alias by choosing the same path.
+	if filepath.Base(filepath.Clean(storageRoot)) != scope.ApplicationInstanceID() {
+		return ""
+	}
+	return sanitizeSchema(filepath.Base(filepath.Dir(filepath.Clean(storageRoot))))
+}
+
+func (m *pgManager) setupForScopeLocked(scope ext.Scope) pgSetup {
+	if setup, ok := m.setups[pgApplicationScopeKey(scope)]; ok {
+		return setup
+	}
+	return pgSetup{dsn: m.dsn, isolate: m.isolate, sharedSchema: m.sharedSchema, logger: m.logger}
+}
+
+func (m *pgManager) loggerForScope(scope ext.Scope) *slog.Logger {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.setupForScopeLocked(scope).logger
+}
+
+func schemaName(prefix string, parts ...string) string {
+	var raw strings.Builder
+	for _, part := range parts {
+		raw.WriteString(part)
+		raw.WriteByte(0)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(raw.String())))[:12]
+	readable := sanitizeSchema(strings.Join(parts, "_"))
+	if readable == "" {
+		readable = "scope"
+	}
+	maxReadable := 63 - len(prefix) - len(digest) - 2
+	if len(readable) > maxReadable {
+		readable = readable[:maxReadable]
+	}
+	return prefix + "_" + readable + "_" + digest
+}
+
+// schemaForScope preserves the legacy public/shared schema behavior for old
+// hosts. Explicit Pulp scopes receive an application-instance schema in
+// shared mode, and a cell-instance schema in isolation mode. Thus shared
+// first-party cells within one app still share tables, but identically named
+// cells in another app can never reach them through an unqualified query.
+func (m *pgManager) schemaForScope(scope ext.Scope) string {
+	m.mu.RLock()
+	setup := m.setupForScopeLocked(scope)
+	m.mu.RUnlock()
+	if scope.IsLegacy() {
+		if !setup.isolate {
+			return setup.sharedSchema
+		}
+		return legacyCellSchema(scope.CellID())
+	}
+	parts := []string{scope.ApplicationID(), scope.ApplicationInstanceID(), setup.storageNamespace}
+	if setup.isolate {
+		parts = append(parts, scope.CellID(), scope.CellInstanceID())
+		return schemaName("cell", parts...)
+	}
+	return schemaName("app", parts...)
+}
+
+func legacyCellSchema(cellID string) string {
+	s := sanitizeSchema(cellID)
+	if s == "" {
+		s = "cell"
+	}
+	return "cell_" + s
+}
+
 // openForCell opens a connection pool pinned to the cell's schema via
 // search_path, creating the schema if it does not exist, and caches the
 // handle. Idempotent — returns the cached *sql.DB on subsequent calls.
-func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
+// openLegacyForCell retains the former implementation as a narrow legacy
+// helper while openForCell below routes normal callers through full scopes.
+func (m *pgManager) openLegacyForCell(cellID string) (*sql.DB, error) {
+	key, err := pgKey(ext.LegacyScope(cellID))
+	if err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
-	if db, ok := m.dbs[cellID]; ok {
+	if db, ok := m.dbs[key]; ok {
 		m.mu.RUnlock()
 		return db, nil
 	}
@@ -209,7 +397,7 @@ func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// Re-check under the write lock — another caller may have raced us.
-	if db, ok := m.dbs[cellID]; ok {
+	if db, ok := m.dbs[key]; ok {
 		return db, nil
 	}
 	if m.dsn == "" {
@@ -272,7 +460,7 @@ func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 
-	m.dbs[cellID] = db
+	m.dbs[key] = db
 	if m.logger != nil {
 		m.logger.Info("storage.postgres ready", "cell", cellID, "schema", schema)
 	}
@@ -280,10 +468,165 @@ func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
 }
 
 func (m *pgManager) get(cellID string) (*sql.DB, bool) {
+	key, err := pgKey(ext.LegacyScope(cellID))
+	if err != nil {
+		return nil, false
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	db, ok := m.dbs[cellID]
+	db, ok := m.dbs[key]
 	return db, ok
+}
+
+const (
+	postgresResourceType = "storage.postgres"
+	postgresResourceID   = "database"
+)
+
+func pgKey(scope ext.Scope) (ext.ResourceKey, error) {
+	if err := scope.Validate(); err != nil {
+		return ext.ResourceKey{}, fmt.Errorf("storage.postgres: invalid scope: %w", err)
+	}
+	return scope.ResourceKey(postgresResourceType, postgresResourceID)
+}
+
+func schemaForSetup(scope ext.Scope, setup pgSetup) string {
+	if scope.IsLegacy() {
+		if !setup.isolate {
+			return setup.sharedSchema
+		}
+		return legacyCellSchema(scope.CellID())
+	}
+	parts := []string{scope.ApplicationID(), scope.ApplicationInstanceID(), setup.storageNamespace}
+	if setup.isolate {
+		return schemaName("cell", append(parts, scope.CellID(), scope.CellInstanceID())...)
+	}
+	return schemaName("app", parts...)
+}
+
+func (m *pgManager) openForCell(cellID string) (*sql.DB, error) {
+	return m.openForScope(ext.LegacyScope(cellID))
+}
+
+func (m *pgManager) openForScope(scope ext.Scope) (*sql.DB, error) {
+	if scope.IsLegacy() {
+		return m.openLegacyForCell(scope.CellID())
+	}
+	key, err := pgKey(scope)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	if db, ok := m.dbs[key]; ok {
+		m.mu.RUnlock()
+		return db, nil
+	}
+	m.mu.RUnlock()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureMapsLocked()
+	if db, ok := m.dbs[key]; ok {
+		return db, nil
+	}
+	setup := m.setupForScopeLocked(scope)
+	if setup.dsn == "" {
+		return nil, fmt.Errorf("storage.postgres: setup not called before register")
+	}
+	schema := schemaForSetup(scope, setup)
+	if schema == "" {
+		return nil, fmt.Errorf("storage.postgres: empty schema for scope %q", scope.RoutingID())
+	}
+	if schema != "public" {
+		bootstrap, err := sql.Open("postgres", setup.dsn)
+		if err != nil {
+			return nil, fmt.Errorf("open bootstrap: %w", err)
+		}
+		if _, err := bootstrap.Exec(`CREATE SCHEMA IF NOT EXISTS "` + schema + `"`); err != nil {
+			_ = bootstrap.Close()
+			return nil, fmt.Errorf("create schema %q: %w", schema, err)
+		}
+		_ = bootstrap.Close()
+	}
+	dsn := setup.dsn
+	if schema != "public" {
+		withPath, err := dsnWithSearchPath(setup.dsn, schema)
+		if err != nil {
+			return nil, fmt.Errorf("build dsn: %w", err)
+		}
+		dsn = withPath
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open postgres: %w", err)
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping postgres: %w", err)
+	}
+	m.dbs[key] = db
+	if setup.logger != nil {
+		setup.logger.Info("storage.postgres ready", "scope", key, "schema", schema)
+	}
+	return db, nil
+}
+
+func (m *pgManager) getForScope(scope ext.Scope) (*sql.DB, bool) {
+	key, err := pgKey(scope)
+	if err != nil {
+		return nil, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	db, ok := m.dbs[key]
+	return db, ok
+}
+
+func (m *pgManager) existingConnection(scope ext.Scope) (*sql.DB, error) {
+	key, err := pgKey(scope)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	db, ok := m.dbs[key]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, ErrConnectionUnavailable
+	}
+	return db, nil
+}
+
+func (m *pgManager) closeCellTarget(target string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, db := range m.dbs {
+		if !key.Scope().IsLegacy() && key.Scope().RoutingID() == target {
+			return m.closeKeyLocked(key, db)
+		}
+	}
+	key, err := pgKey(ext.LegacyScope(target))
+	if err != nil {
+		return err
+	}
+	if db, ok := m.dbs[key]; ok {
+		return m.closeKeyLocked(key, db)
+	}
+	return nil
+}
+
+func (m *pgManager) closeKeyLocked(key ext.ResourceKey, db *sql.DB) error {
+	delete(m.dbs, key)
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", key, err)
+	}
+	if logger := m.setupForScopeLocked(key.Scope()).logger; logger != nil {
+		logger.Info("storage.postgres teardown cell", "scope", key)
+	}
+	return nil
 }
 
 // isTrue reports whether an env-var value means "enabled". Accepts the
@@ -378,22 +721,27 @@ type QueryResult struct {
 // ---- binding --------------------------------------------------------------
 
 func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	cellID := cell.Name()
+	scope, err := ext.ValidatedScopeOf(cell)
+	if err != nil {
+		return fmt.Errorf("storage.postgres: resolve cell scope: %w", err)
+	}
 	// Open eagerly so a misconfigured DSN / unreachable server fails at
 	// cell load, not on the first query, and the cell's schema is
 	// created up front. Errors here abort cell registration.
-	if _, err := manager.openForCell(cellID); err != nil {
-		return fmt.Errorf("storage.postgres: open for cell %q: %w", cellID, err)
+	if _, err := manager.openForScope(scope); err != nil {
+		return fmt.Errorf("storage.postgres: open for scope %q: %w", scope.RoutingID(), err)
 	}
 	exec := func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
-		return pgExec(ctx, m, cellID, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut)
+		return pgExec(ctx, m, scope, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut)
 	}
 	query := func(ctx context.Context, m api.Module, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
-		return pgQuery(ctx, m, cellID, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut)
+		return pgQuery(ctx, m, scope, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut)
 	}
 	b.NewFunctionBuilder().WithFunc(exec).Export("sqlite_exec")
 	b.NewFunctionBuilder().WithFunc(query).Export("sqlite_query")
-	manager.logger.Info("storage.postgres bound", "cell", cellID)
+	if logger := manager.loggerForScope(scope); logger != nil {
+		logger.Info("storage.postgres bound", "scope", scope.RoutingID())
+	}
 	return nil
 }
 
@@ -406,7 +754,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 // ---- handlers -------------------------------------------------------------
 
-func pgExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
+func pgExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr, pLen, resPtrOut, resLenOut uint32) uint32 {
 	if qLen == 0 {
 		return 1
 	}
@@ -418,7 +766,7 @@ func pgExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, 
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.get(cellID)
+	db, ok := manager.getForScope(scope)
 	if !ok {
 		return 9
 	}
@@ -434,7 +782,9 @@ func pgExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, 
 	}
 	var out ExecResult
 	if ra, raErr := res.RowsAffected(); raErr != nil {
-		manager.logger.Warn("postgres: RowsAffected failed", "err", raErr)
+		if logger := manager.loggerForScope(scope); logger != nil {
+			logger.Warn("postgres: RowsAffected failed", "err", raErr)
+		}
 	} else {
 		out.RowsAffected = ra
 	}
@@ -447,7 +797,7 @@ func pgExec(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, 
 	return writeResponse(ctx, m, encoded, resPtrOut, resLenOut)
 }
 
-func pgQuery(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
+func pgQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr, pLen, rowsPtrOut, rowsLenOut uint32) uint32 {
 	if qLen == 0 {
 		return 1
 	}
@@ -459,7 +809,7 @@ func pgQuery(ctx context.Context, m api.Module, cellID string, qPtr, qLen, pPtr,
 	if code != 0 {
 		return code
 	}
-	db, ok := manager.get(cellID)
+	db, ok := manager.getForScope(scope)
 	if !ok {
 		return 9
 	}

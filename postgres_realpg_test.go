@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BananaLabs-OSS/Pulp/ext"
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 )
 
@@ -70,7 +71,7 @@ func requirePG(t *testing.T) {
 func newRealManager(t *testing.T, isolate bool) *pgManager {
 	t.Helper()
 	m := &pgManager{
-		dbs:          map[string]*sql.DB{},
+		dbs:          map[ext.ResourceKey]*sql.DB{},
 		dsn:          testDSN,
 		isolate:      isolate,
 		sharedSchema: defaultSharedSchema,
@@ -253,4 +254,3 @@ func TestRealPG_BooleanRoundTrip(t *testing.T) {
 		t.Fatalf("WHERE sent=false selected id=%d, want 2", id)
 	}
 }
-
