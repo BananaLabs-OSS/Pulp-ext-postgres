@@ -261,6 +261,9 @@ func rejectSQLiteOnly(pieces []sqlPiece) error {
 }
 
 func rewriteSQLiteDDL(pieces []sqlPiece) error {
+	if !isSQLiteDDL(pieces) {
+		return nil
+	}
 	for i := range pieces {
 		if equalWord(pieces[i], "BLOB") {
 			pieces[i].text = "BYTEA"
@@ -279,7 +282,24 @@ func rewriteSQLiteDDL(pieces []sqlPiece) error {
 		pieces[i].text = "BIGSERIAL"
 		pieces[autoincrement].text = ""
 	}
+	// SQLite INTEGER is always a signed 64-bit value. PostgreSQL INTEGER is
+	// only 32-bit, so timestamps in milliseconds and other ordinary SQLite
+	// integer values overflow unless every remaining INTEGER declaration is
+	// widened. AUTOINCREMENT identities were already rewritten to BIGSERIAL.
+	for i := range pieces {
+		if equalWord(pieces[i], "INTEGER") {
+			pieces[i].text = "BIGINT"
+		}
+	}
 	return nil
+}
+
+// isSQLiteDDL keeps type rewrites out of normal query expressions. The
+// storage.sqlite ABI needs SQLite type semantics only in table definitions
+// and ALTER TABLE column additions, not in SELECT casts or predicates.
+func isSQLiteDDL(pieces []sqlPiece) bool {
+	first := nextCodeWord(pieces, 0)
+	return first >= 0 && (equalWord(pieces[first], "CREATE") || equalWord(pieces[first], "ALTER"))
 }
 
 func rewriteHexLiterals(pieces []sqlPiece) error {

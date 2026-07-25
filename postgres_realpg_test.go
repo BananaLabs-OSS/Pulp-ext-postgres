@@ -267,18 +267,19 @@ func TestRealPG_SQLiteABICompatibility(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = db.Exec(`DROP TABLE IF EXISTS sqlite_abi_rt`) })
 
-	ddl, err := rewriteSQLiteSQL(`CREATE TABLE sqlite_abi_rt (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL DEFAULT X'', name text UNIQUE)`, 0)
+	ddl, err := rewriteSQLiteSQL(`CREATE TABLE sqlite_abi_rt (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at_unix_ms INTEGER NOT NULL, payload BLOB NOT NULL DEFAULT X'', name text UNIQUE)`, 0)
 	if err != nil {
 		t.Fatalf("rewrite DDL: %v", err)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		t.Fatalf("execute rewritten DDL: %v; sql=%s", err, ddl)
 	}
-	insert, err := rewriteSQLiteSQL(`INSERT INTO sqlite_abi_rt (payload, name) VALUES (X'CAFE', ?)`, 1)
+	insert, err := rewriteSQLiteSQL(`INSERT INTO sqlite_abi_rt (occurred_at_unix_ms, payload, name) VALUES (?, X'CAFE', ?)`, 2)
 	if err != nil {
 		t.Fatalf("rewrite insert: %v", err)
 	}
-	if _, err := db.Exec(insert, "first"); err != nil {
+	const milliseconds = int64(1_753_465_600_123)
+	if _, err := db.Exec(insert, milliseconds, "first"); err != nil {
 		t.Fatalf("execute rewritten insert: %v; sql=%s", err, insert)
 	}
 	query, err := rewriteSQLiteSQL(`SELECT encode(payload, 'hex') FROM sqlite_abi_rt WHERE name = ?`, 1)
@@ -291,6 +292,13 @@ func TestRealPG_SQLiteABICompatibility(t *testing.T) {
 	}
 	if hex != "cafe" {
 		t.Fatalf("stored BLOB = %q, want cafe", hex)
+	}
+	var storedMilliseconds int64
+	if err := db.QueryRow(`SELECT occurred_at_unix_ms FROM sqlite_abi_rt WHERE name = 'first'`).Scan(&storedMilliseconds); err != nil {
+		t.Fatalf("read millisecond timestamp: %v", err)
+	}
+	if storedMilliseconds != milliseconds {
+		t.Fatalf("stored millisecond timestamp = %d, want %d", storedMilliseconds, milliseconds)
 	}
 }
 

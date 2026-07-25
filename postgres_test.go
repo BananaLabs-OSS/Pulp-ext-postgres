@@ -1,6 +1,9 @@
 package postgresext
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestSchemaForSharedDefault is the regression guard for the
 // Evolution↔Sessions-Gene shared-table read. With isolation NOT opted
@@ -70,5 +73,47 @@ func TestIsTrue(t *testing.T) {
 		if isTrue(s) {
 			t.Errorf("isTrue(%q) = true, want false", s)
 		}
+	}
+}
+
+func TestDSNForSchemaEnablesOneExchangeParameterizedQueries(t *testing.T) {
+	tests := []struct {
+		name   string
+		dsn    string
+		schema string
+		want   string
+	}{
+		{
+			name:   "url shared schema",
+			dsn:    "postgres://user:password@example.test:5432/app?sslmode=require",
+			schema: "public",
+			want:   "binary_parameters=yes",
+		},
+		{
+			name:   "url custom schema preserves search path",
+			dsn:    "postgres://user:password@example.test/app",
+			schema: "app",
+			want:   "binary_parameters=yes",
+		},
+		{
+			name:   "keyword DSN",
+			dsn:    "host=example.test dbname=app sslmode=require",
+			schema: "public",
+			want:   "binary_parameters=yes",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := dsnForSchema(tt.dsn, tt.schema)
+			if err != nil {
+				t.Fatalf("dsnForSchema: %v", err)
+			}
+			if !strings.Contains(got, tt.want) {
+				t.Fatalf("dsnForSchema() = %q, want %q", got, tt.want)
+			}
+			if tt.schema != "public" && !strings.Contains(got, "search_path") {
+				t.Fatalf("dsnForSchema(%q) lost schema path: %q", tt.schema, got)
+			}
+		})
 	}
 }

@@ -38,9 +38,21 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 		},
 		{
 			name: "sqlite ddl and byte literals",
-			in:   "CREATE TABLE commerce (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB DEFAULT X'', seed BLOB DEFAULT X'cAFE')",
+			in:   "CREATE TABLE commerce (id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL, payload BLOB DEFAULT X'', seed BLOB DEFAULT X'cAFE')",
 			args: 0,
-			want: "CREATE TABLE commerce (id BIGSERIAL PRIMARY KEY , payload BYTEA DEFAULT decode('', 'hex'), seed BYTEA DEFAULT decode('cAFE', 'hex'))",
+			want: "CREATE TABLE commerce (id BIGSERIAL PRIMARY KEY , created_at BIGINT NOT NULL, payload BYTEA DEFAULT decode('', 'hex'), seed BYTEA DEFAULT decode('cAFE', 'hex'))",
+		},
+		{
+			name: "sqlite alter table integer is int64",
+			in:   "ALTER TABLE commerce ADD COLUMN lease_expires_unix_ms INTEGER NOT NULL DEFAULT 0",
+			args: 0,
+			want: "ALTER TABLE commerce ADD COLUMN lease_expires_unix_ms BIGINT NOT NULL DEFAULT 0",
+		},
+		{
+			name: "query integer word is untouched",
+			in:   "SELECT CAST(? AS INTEGER)",
+			args: 1,
+			want: "SELECT CAST($1 AS INTEGER)",
 		},
 	}
 	for _, tt := range tests {

@@ -652,10 +652,38 @@ func sanitizeSchema(s string) string {
 // already first on PostgreSQL's default search_path, so it intentionally keeps
 // the original DSN: managed poolers reject libpq startup `options` parameters.
 func dsnForSchema(dsn, schema string) (string, error) {
-	if schema == defaultSharedSchema {
-		return dsn, nil
+	if schema != defaultSharedSchema {
+		var err error
+		dsn, err = dsnWithSearchPath(dsn, schema)
+		if err != nil {
+			return "", err
+		}
 	}
-	return dsnWithSearchPath(dsn, schema)
+	// lib/pq otherwise sends parameterized statements as a Parse followed by
+	// later Bind/Execute messages. Transaction-pooling proxies may route those
+	// separate exchanges to different backends, which loses lib/pq's unnamed
+	// statement. Binary parameters keep the complete unnamed Parse/Bind/Execute
+	// sequence in one exchange, while retaining parameter binding (never string
+	// interpolation) and the scope's single-connection transaction boundary.
+	return dsnWithBinaryParameters(dsn)
+}
+
+// dsnWithBinaryParameters ensures lib/pq uses its one-exchange parameterized
+// query path. It supports both libpq URL and keyword/value DSNs. Appending the
+// keyword form deliberately gives this extension's required value precedence
+// if an operator supplied a conflicting earlier setting.
+func dsnWithBinaryParameters(dsn string) (string, error) {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", err
+		}
+		q := u.Query()
+		q.Set("binary_parameters", "yes")
+		u.RawQuery = q.Encode()
+		return u.String(), nil
+	}
+	return dsn + " binary_parameters=yes", nil
 }
 
 // dsnWithSearchPath returns dsn with libpq `options=-c search_path=<schema>`
