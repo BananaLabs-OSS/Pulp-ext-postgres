@@ -254,3 +254,74 @@ func TestRealPG_BooleanRoundTrip(t *testing.T) {
 		t.Fatalf("WHERE sent=false selected id=%d, want 2", id)
 	}
 }
+
+// TestRealPG_SQLiteABICompatibility exercises the bounded adapter against a
+// real Postgres server using the storage.sqlite statement forms emitted by
+// Sessions owners: SQLite DDL, BLOB defaults, X'hex' values, and ? parameters.
+func TestRealPG_SQLiteABICompatibility(t *testing.T) {
+	requirePG(t)
+	m := newRealManager(t, false)
+	db, err := m.openForCell("sqlite-abi")
+	if err != nil {
+		t.Fatalf("openForCell: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`DROP TABLE IF EXISTS sqlite_abi_rt`) })
+
+	ddl, err := rewriteSQLiteSQL(`CREATE TABLE sqlite_abi_rt (id INTEGER PRIMARY KEY AUTOINCREMENT, payload BLOB NOT NULL DEFAULT X'', name text UNIQUE)`, 0)
+	if err != nil {
+		t.Fatalf("rewrite DDL: %v", err)
+	}
+	if _, err := db.Exec(ddl); err != nil {
+		t.Fatalf("execute rewritten DDL: %v; sql=%s", err, ddl)
+	}
+	insert, err := rewriteSQLiteSQL(`INSERT INTO sqlite_abi_rt (payload, name) VALUES (X'CAFE', ?)`, 1)
+	if err != nil {
+		t.Fatalf("rewrite insert: %v", err)
+	}
+	if _, err := db.Exec(insert, "first"); err != nil {
+		t.Fatalf("execute rewritten insert: %v; sql=%s", err, insert)
+	}
+	query, err := rewriteSQLiteSQL(`SELECT encode(payload, 'hex') FROM sqlite_abi_rt WHERE name = ?`, 1)
+	if err != nil {
+		t.Fatalf("rewrite query: %v", err)
+	}
+	var hex string
+	if err := db.QueryRow(query, "first").Scan(&hex); err != nil {
+		t.Fatalf("execute rewritten query: %v; sql=%s", err, query)
+	}
+	if hex != "cafe" {
+		t.Fatalf("stored BLOB = %q, want cafe", hex)
+	}
+}
+
+// TestRealPG_HostStyleTransactionRollback guards the storage.sqlite ABI:
+// BEGIN, statements, and ROLLBACK are separate host calls, so a cell scope
+// must use one connection and retain transactional state across those calls.
+func TestRealPG_HostStyleTransactionRollback(t *testing.T) {
+	requirePG(t)
+	m := newRealManager(t, false)
+	db, err := m.openForCell("transaction-abi")
+	if err != nil {
+		t.Fatalf("openForCell: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`DROP TABLE IF EXISTS transaction_abi_rt`) })
+	if _, err := db.Exec(`CREATE TABLE transaction_abi_rt (id int primary key)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := db.Exec(`BEGIN`); err != nil {
+		t.Fatalf("BEGIN: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO transaction_abi_rt (id) VALUES (1)`); err != nil {
+		t.Fatalf("transactional insert: %v", err)
+	}
+	if _, err := db.Exec(`ROLLBACK`); err != nil {
+		t.Fatalf("ROLLBACK: %v", err)
+	}
+	var count int
+	if err := db.QueryRow(`SELECT count(*) FROM transaction_abi_rt`).Scan(&count); err != nil {
+		t.Fatalf("count after rollback: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rollback leaked %d row(s)", count)
+	}
+}

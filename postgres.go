@@ -3,9 +3,12 @@
 //
 // This is a drop-in replacement for Pulp-ext-sqlite. It registers the
 // same host import names (sqlite_exec, sqlite_query) so existing cell
-// WASM binaries work without recompilation. The cell-side code
-// switches to pgdialect to emit Postgres-flavoured SQL; the host
-// simply executes whatever SQL it receives.
+// WASM binaries work without recompilation. The host has a deliberately
+// bounded SQL compatibility adapter for the SQLite-storage ABI: it rewrites
+// positional ? binds, BLOB, INTEGER PRIMARY KEY AUTOINCREMENT, and X'hex'
+// literals to their Postgres equivalents. Native Postgres $n SQL passes
+// through unchanged. Ambiguous or unsupported SQLite-only syntax fails
+// closed rather than being guessed or silently corrupted.
 //
 // Shared schema (DEFAULT): the platform's first-party cells
 // intentionally share tables — e.g. the Evolution engine WRITES
@@ -28,10 +31,9 @@
 // for the current first-party shared-table deployment, so it is opt-in:
 // set STORAGE_POSTGRES_ISOLATE=true to enable per-cell schemas.
 //
-// The host never parses or rewrites the cell's SQL — scoping is done
-// purely at the connection level (search_path), so no key-prefix /
-// cell_id column threading is required and existing cell SQL is
-// unchanged.
+// Schema scoping is done purely at the connection level (search_path), so no
+// key-prefix / cell_id column threading is required. SQL beyond the documented
+// adapter boundary must use portable SQL or native Postgres syntax.
 //
 // Deployment:
 //
@@ -440,8 +442,11 @@ func (m *pgManager) openLegacyForCell(cellID string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(2)
+	// storage.sqlite exposes transaction control as separate host calls.
+	// One connection is required per cell scope; otherwise BEGIN/COMMIT/
+	// ROLLBACK can land on different pooled sessions.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	// Bound connection lifetime so connections recycled / killed
 	// server-side by a managed pooler (Crunchy Bridge / pgbouncer,
@@ -546,8 +551,9 @@ func (m *pgManager) openForScope(scope ext.Scope) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open postgres: %w", err)
 	}
-	db.SetMaxOpenConns(5)
-	db.SetMaxIdleConns(2)
+	// Host-level transaction calls require one connection for this scope.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err := db.Ping(); err != nil {
@@ -767,7 +773,17 @@ func pgExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr
 		return 9
 	}
 
-	res, err := db.ExecContext(ctx, string(q), args...)
+	statement, err := rewriteSQLiteSQL(string(q), len(args))
+	if err != nil {
+		encoded, mErr := msgpack.Marshal(ExecResult{Error: err.Error()})
+		if mErr != nil {
+			return 5
+		}
+		_ = writeResponse(ctx, m, encoded, resPtrOut, resLenOut)
+		return 5
+	}
+
+	res, err := db.ExecContext(ctx, statement, args...)
 	if err != nil {
 		encoded, mErr := msgpack.Marshal(ExecResult{Error: err.Error()})
 		if mErr != nil {
@@ -810,7 +826,12 @@ func pgQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPt
 		return 9
 	}
 
-	rows, err := db.QueryContext(ctx, string(q), args...)
+	statement, err := rewriteSQLiteSQL(string(q), len(args))
+	if err != nil {
+		return writeQueryError(ctx, m, err, rowsPtrOut, rowsLenOut)
+	}
+
+	rows, err := db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return writeQueryError(ctx, m, err, rowsPtrOut, rowsLenOut)
 	}
