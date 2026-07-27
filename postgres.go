@@ -140,6 +140,7 @@ func ExistingConnection(scope ext.Scope) (*sql.DB, error) {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "storage.sqlite", // same ABI surface as ext-sqlite
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-postgres",
 		Setup:         setup,
 		Teardown:      teardown,
 		TeardownScope: teardownScope,
