@@ -67,7 +67,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	_ "github.com/lib/pq"
@@ -448,11 +447,12 @@ func (m *pgManager) openLegacyForCell(cellID string) (*sql.DB, error) {
 	// ROLLBACK can land on different pooled sessions.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-	// Bound connection lifetime so connections recycled / killed
-	// server-side by a managed pooler (Crunchy Bridge / pgbouncer,
-	// failover, idle reaper) are not handed out dead.
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// Do not recycle this connection by age or idle time. The storage.sqlite
+	// transaction ABI sends BEGIN, statements, and COMMIT as separate host
+	// calls, so database/sql must retain the same physical connection across
+	// those calls. Expiring it between calls rolls the transaction back and
+	// lets later statements run outside it. lib/pq reports a remotely closed
+	// connection as bad, allowing database/sql to replace it on demand.
 
 	if err := db.Ping(); err != nil {
 		db.Close()
@@ -555,8 +555,8 @@ func (m *pgManager) openForScope(scope ext.Scope) (*sql.DB, error) {
 	// Host-level transaction calls require one connection for this scope.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	db.SetConnMaxIdleTime(5 * time.Minute)
-	db.SetConnMaxLifetime(5 * time.Minute)
+	// See openLegacyForCell: transaction control crosses host calls and
+	// therefore requires a stable physical connection for this scope.
 	if err := db.Ping(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
