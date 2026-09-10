@@ -1,4 +1,4 @@
-package postgresext
+package sqlitecompat
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ import (
 // surface that existing Pulp WASM cells emit. It is not a general SQLite
 // dialect converter: any SQLite-only form outside this surface is rejected so
 // a host never executes SQL with altered meaning.
-func rewriteSQLiteSQL(query string, argCount int) (string, error) {
+func Rewrite(query string, argCount int) (string, error) {
 	pieces, err := lexSQL(query)
 	if err != nil {
 		return "", fmt.Errorf("storage.postgres: invalid SQL: %w", err)

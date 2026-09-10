@@ -1,4 +1,4 @@
-package postgresext
+package sqlitecompat
 
 import (
 	"strings"
@@ -57,7 +57,7 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := rewriteSQLiteSQL(tt.in, tt.args)
+			got, err := Rewrite(tt.in, tt.args)
 			if err != nil {
 				t.Fatalf("rewriteSQLiteSQL() error = %v", err)
 			}
@@ -87,7 +87,7 @@ func TestRewriteSQLiteSQLRejectsUnsafeOrAmbiguousSyntax(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := rewriteSQLiteSQL(tt.in, tt.args)
+			_, err := Rewrite(tt.in, tt.args)
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("rewriteSQLiteSQL() error = %v, want containing %q", err, tt.want)
 			}

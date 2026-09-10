@@ -23,6 +23,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BananaLabs-OSS/Pulp-ext-postgres/sqlitecompat"
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	embeddedpostgres "github.com/fergusstrange/embedded-postgres"
 )
@@ -267,14 +268,14 @@ func TestRealPG_SQLiteABICompatibility(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = db.Exec(`DROP TABLE IF EXISTS sqlite_abi_rt`) })
 
-	ddl, err := rewriteSQLiteSQL(`CREATE TABLE sqlite_abi_rt (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at_unix_ms INTEGER NOT NULL, payload BLOB NOT NULL DEFAULT X'', name text UNIQUE)`, 0)
+	ddl, err := sqlitecompat.Rewrite(`CREATE TABLE sqlite_abi_rt (id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at_unix_ms INTEGER NOT NULL, payload BLOB NOT NULL DEFAULT X'', name text UNIQUE)`, 0)
 	if err != nil {
 		t.Fatalf("rewrite DDL: %v", err)
 	}
 	if _, err := db.Exec(ddl); err != nil {
 		t.Fatalf("execute rewritten DDL: %v; sql=%s", err, ddl)
 	}
-	insert, err := rewriteSQLiteSQL(`INSERT INTO sqlite_abi_rt (occurred_at_unix_ms, payload, name) VALUES (?, X'CAFE', ?)`, 2)
+	insert, err := sqlitecompat.Rewrite(`INSERT INTO sqlite_abi_rt (occurred_at_unix_ms, payload, name) VALUES (?, X'CAFE', ?)`, 2)
 	if err != nil {
 		t.Fatalf("rewrite insert: %v", err)
 	}
@@ -282,7 +283,7 @@ func TestRealPG_SQLiteABICompatibility(t *testing.T) {
 	if _, err := db.Exec(insert, milliseconds, "first"); err != nil {
 		t.Fatalf("execute rewritten insert: %v; sql=%s", err, insert)
 	}
-	query, err := rewriteSQLiteSQL(`SELECT encode(payload, 'hex') FROM sqlite_abi_rt WHERE name = ?`, 1)
+	query, err := sqlitecompat.Rewrite(`SELECT encode(payload, 'hex') FROM sqlite_abi_rt WHERE name = ?`, 1)
 	if err != nil {
 		t.Fatalf("rewrite query: %v", err)
 	}

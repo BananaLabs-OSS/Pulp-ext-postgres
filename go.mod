@@ -4,6 +4,7 @@ go 1.25.6
 
 require (
 	github.com/BananaLabs-OSS/Pulp v0.0.0
+	github.com/BananaLabs-OSS/Pulp-ext-postgres/sqlitecompat v0.0.0
 	github.com/fergusstrange/embedded-postgres v1.34.0
 	github.com/lib/pq v1.10.9
 	github.com/tetratelabs/wazero v1.11.0
@@ -17,3 +18,5 @@ require (
 )
 
 replace github.com/BananaLabs-OSS/Pulp => ../Pulp
+
+replace github.com/BananaLabs-OSS/Pulp-ext-postgres/sqlitecompat => ./sqlitecompat

@@ -68,6 +68,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/BananaLabs-OSS/Pulp-ext-postgres/sqlitecompat"
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	_ "github.com/lib/pq"
 	"github.com/tetratelabs/wazero"
@@ -802,7 +803,7 @@ func pgExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr
 		return 9
 	}
 
-	statement, err := rewriteSQLiteSQL(string(q), len(args))
+	statement, err := sqlitecompat.Rewrite(string(q), len(args))
 	if err != nil {
 		encoded, mErr := msgpack.Marshal(ExecResult{Error: err.Error()})
 		if mErr != nil {
@@ -855,7 +856,7 @@ func pgQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPt
 		return 9
 	}
 
-	statement, err := rewriteSQLiteSQL(string(q), len(args))
+	statement, err := sqlitecompat.Rewrite(string(q), len(args))
 	if err != nil {
 		return writeQueryError(ctx, m, err, rowsPtrOut, rowsLenOut)
 	}
