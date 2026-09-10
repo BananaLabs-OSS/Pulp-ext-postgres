@@ -45,6 +45,11 @@ func Rewrite(query string, argCount int) (string, error) {
 			n++
 			pieces[i].text = "$" + strconv.Itoa(n)
 		}
+		if equalWord(pieces[i], "TRUE") {
+			pieces[i].text = "1"
+		} else if equalWord(pieces[i], "FALSE") {
+			pieces[i].text = "0"
+		}
 	}
 	if err := rewriteSQLiteDDL(pieces); err != nil {
 		return "", err
@@ -267,6 +272,11 @@ func rewriteSQLiteDDL(pieces []sqlPiece) error {
 	for i := range pieces {
 		if equalWord(pieces[i], "BLOB") {
 			pieces[i].text = "BYTEA"
+		}
+		// The storage.sqlite ABI represents booleans as integer 0/1, and
+		// existing cell predicates intentionally use that representation.
+		if equalWord(pieces[i], "BOOLEAN") {
+			pieces[i].text = "BIGINT"
 		}
 	}
 	for i := range pieces {

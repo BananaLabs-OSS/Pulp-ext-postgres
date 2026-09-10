@@ -43,6 +43,7 @@ func (c *sqliteCompatConn) ExecContext(ctx context.Context, query string, args [
 	if err != nil {
 		return nil, err
 	}
+	normalizeNamedValues(args)
 	return exec.ExecContext(ctx, rewritten, args)
 }
 
@@ -55,7 +56,26 @@ func (c *sqliteCompatConn) QueryContext(ctx context.Context, query string, args 
 	if err != nil {
 		return nil, err
 	}
+	normalizeNamedValues(args)
 	return queryer.QueryContext(ctx, rewritten, args)
+}
+
+func normalizeNamedValues(args []driver.NamedValue) {
+	for i := range args {
+		args[i].Value = NormalizeValue(args[i].Value)
+	}
+}
+
+// NormalizeValue preserves SQLite's integer representation of booleans when
+// calls cross the PostgreSQL wire protocol.
+func NormalizeValue(value any) any {
+	if boolean, ok := value.(bool); ok {
+		if boolean {
+			return int64(1)
+		}
+		return int64(0)
+	}
+	return value
 }
 
 func (c *sqliteCompatConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {

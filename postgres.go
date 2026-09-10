@@ -812,6 +812,9 @@ func pgExec(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPtr
 		_ = writeResponse(ctx, m, encoded, resPtrOut, resLenOut)
 		return 5
 	}
+	for i := range args {
+		args[i] = sqlitecompat.NormalizeValue(args[i])
+	}
 
 	res, err := db.ExecContext(ctx, statement, args...)
 	if err != nil {
@@ -859,6 +862,9 @@ func pgQuery(ctx context.Context, m api.Module, scope ext.Scope, qPtr, qLen, pPt
 	statement, err := sqlitecompat.Rewrite(string(q), len(args))
 	if err != nil {
 		return writeQueryError(ctx, m, err, rowsPtrOut, rowsLenOut)
+	}
+	for i := range args {
+		args[i] = sqlitecompat.NormalizeValue(args[i])
 	}
 
 	rows, err := db.QueryContext(ctx, statement, args...)

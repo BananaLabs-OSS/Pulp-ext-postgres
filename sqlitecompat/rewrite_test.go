@@ -13,6 +13,18 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 		want string
 	}{
 		{
+			name: "sqlite boolean storage",
+			in:   `CREATE TABLE flags (enabled BOOLEAN NOT NULL DEFAULT FALSE, payload BLOB)`,
+			args: 0,
+			want: `CREATE TABLE flags (enabled BIGINT NOT NULL DEFAULT 0, payload BYTEA)`,
+		},
+		{
+			name: "sqlite boolean predicate",
+			in:   `SELECT id FROM flags WHERE enabled=TRUE`,
+			args: 0,
+			want: `SELECT id FROM flags WHERE enabled=1`,
+		},
+		{
 			name: "sqlite placeholders",
 			in:   "SELECT * FROM orders WHERE id = ? AND state = ?",
 			args: 2,
@@ -65,6 +77,18 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 				t.Fatalf("rewriteSQLiteSQL() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeValuePreservesSQLiteBooleanRepresentation(t *testing.T) {
+	if got := NormalizeValue(true); got != int64(1) {
+		t.Fatalf("NormalizeValue(true) = %#v", got)
+	}
+	if got := NormalizeValue(false); got != int64(0) {
+		t.Fatalf("NormalizeValue(false) = %#v", got)
+	}
+	if got := NormalizeValue("true"); got != "true" {
+		t.Fatalf("NormalizeValue(string) = %#v", got)
 	}
 }
 
