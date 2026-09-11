@@ -2,16 +2,26 @@ package sqlitecompat
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
 )
+
+var sqliteBusyTimeout = regexp.MustCompile(`(?i)^\s*PRAGMA\s+busy_timeout\s*=\s*[0-9]+\s*;?\s*$`)
 
 // rewriteSQLiteSQL translates the small, documented SQLite-storage ABI
 // surface that existing Pulp WASM cells emit. It is not a general SQLite
 // dialect converter: any SQLite-only form outside this surface is rejected so
 // a host never executes SQL with altered meaning.
 func Rewrite(query string, argCount int) (string, error) {
+	// busy_timeout controls SQLite file-lock waiting. Postgres already owns
+	// lock-wait policy and has no equivalent connection pragma, so this exact,
+	// argument-free compatibility hint is a safe no-op. All other PRAGMAs stay
+	// fail-closed below.
+	if argCount == 0 && sqliteBusyTimeout.MatchString(query) {
+		return "SELECT 1 WHERE FALSE", nil
+	}
 	pieces, err := lexSQL(query)
 	if err != nil {
 		return "", fmt.Errorf("storage.postgres: invalid SQL: %w", err)

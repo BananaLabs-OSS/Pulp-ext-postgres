@@ -66,6 +66,12 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 			args: 1,
 			want: "SELECT CAST($1 AS INTEGER)",
 		},
+		{
+			name: "sqlite busy timeout is a safe postgres no-op",
+			in:   " PRAGMA busy_timeout = 250; ",
+			args: 0,
+			want: "SELECT 1 WHERE FALSE",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
