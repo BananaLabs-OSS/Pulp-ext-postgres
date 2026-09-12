@@ -25,6 +25,12 @@ func TestRewriteSQLiteSQL(t *testing.T) {
 			want: `SELECT id FROM flags WHERE enabled=1`,
 		},
 		{
+			name: "bare boolean predicate remains postgres boolean",
+			in:   `SELECT 1 FROM flags WHERE TRUE`,
+			args: 0,
+			want: `SELECT 1 FROM flags WHERE TRUE`,
+		},
+		{
 			name: "sqlite placeholders",
 			in:   "SELECT * FROM orders WHERE id = ? AND state = ?",
 			args: 2,
