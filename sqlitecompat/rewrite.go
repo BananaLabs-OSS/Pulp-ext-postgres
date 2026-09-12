@@ -55,9 +55,9 @@ func Rewrite(query string, argCount int) (string, error) {
 			n++
 			pieces[i].text = "$" + strconv.Itoa(n)
 		}
-		if equalWord(pieces[i], "TRUE") {
+		if equalWord(pieces[i], "TRUE") && !isBarePredicateLiteral(pieces, i) {
 			pieces[i].text = "1"
-		} else if equalWord(pieces[i], "FALSE") {
+		} else if equalWord(pieces[i], "FALSE") && !isBarePredicateLiteral(pieces, i) {
 			pieces[i].text = "0"
 		}
 	}
@@ -247,6 +247,24 @@ func nextCodeWord(pieces []sqlPiece, from int) int {
 		}
 	}
 	return -1
+}
+
+func previousCodeWord(pieces []sqlPiece, from int) int {
+	for i := from; i >= 0; i-- {
+		if pieces[i].kind == sqlWord {
+			return i
+		}
+		if pieces[i].kind == sqlSymbol && pieces[i].text == ";" {
+			return -1
+		}
+	}
+	return -1
+}
+
+func isBarePredicateLiteral(pieces []sqlPiece, at int) bool {
+	previous := previousCodeWord(pieces, at-1)
+	return previous >= 0 && (equalWord(pieces[previous], "WHERE") ||
+		equalWord(pieces[previous], "AND") || equalWord(pieces[previous], "OR"))
 }
 
 func equalWord(piece sqlPiece, word string) bool {
