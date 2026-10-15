@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  root:
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@03801df76fc2698d80f3f83f44db6445de0506d2
+    with:
+      sibling-repositories: BananaLabs-OSS/Pulp
+
+  sqlitecompat:
+    uses: BananaLabs-OSS/.github/.github/workflows/go-ci.yml@03801df76fc2698d80f3f83f44db6445de0506d2
+    with:
+      working-directory: sqlitecompat
